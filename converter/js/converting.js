@@ -1358,17 +1358,19 @@ function convert_MAGIC() {
     "\tAnonymous\t3.0"
   ];
 
-  // One demagnetization type per specimen, used in every table
-  let specimenTypes = getMagicDemagnetizationTypes(specimens);
+  // Steps whose label gives no treatment are left out; then one demagnetization type per specimen, used in every table
+  let readableSpecimens = specimens.map(getMagicReadableSpecimen);
+  notifyMagicUnreadableSteps(readableSpecimens);
+  let specimenTypes = getMagicDemagnetizationTypes(readableSpecimens);
 
-  let exportSpecimens = specimens.filter(x => specimenTypes.get(x));
+  let exportSpecimens = readableSpecimens.filter(x => specimenTypes.get(x));
 
   if(exportSpecimens.length === 0) {
     alert("No specimens to export.");
     return;
   }
 
-  notifyMagicOrientationConflicts(exportSpecimens, x => x.sample || x.name);
+  let orientationConflicts = notifyMagicOrientationConflicts(exportSpecimens, x => x.sample || x.name);
 
   // Sites are taken from the sample names by a naming convention entered by the user
   let siteOf = getMagicSiteNaming();
@@ -1483,7 +1485,7 @@ function convert_MAGIC() {
 
   const samplesHeader = [
     "sample", "site", "lat", "lon", "height", "azimuth", "dip", "bed_dip_direction", "bed_dip",
-    "geologic_classes", "lithologies", "method_codes", "citations"
+    "geologic_classes", "lithologies", "method_codes", "citations", "description"
   ];
 
   let samplesLines = [
@@ -1495,6 +1497,7 @@ function convert_MAGIC() {
 
     samplesLines.push(getMagicRow(samplesHeader, Object.assign({}, s, {
       sample: sampleName,
+      description: orientationConflicts.includes(sampleName) ? MAGIC_ORIENTATION_CONFLICT_NOTE : "",
       geologic_classes: getMagicGeologicClasses(s.geology),
       lithologies: joinMagicValues(s.lithology),
       method_codes: joinMagicValues(s.protocols),
@@ -1525,8 +1528,8 @@ function convert_MAGIC() {
 
   let measurementCounter = 1;
   let experiments = {};
-  let unreadSteps = [];
   let skippedStepConflicts = [];
+  let unmatchedSteps = [];
 
   exportSpecimens.forEach(function(specimen) {
 
@@ -1562,15 +1565,22 @@ function convert_MAGIC() {
     let specimenRows = getMagicInterpretationRows(specimen, type, base);
 
     if(specimenRows.length === 0) {
-      specimenRows.push(Object.assign({}, base, getMagicStepRange(type, specimen), { method_codes: protocol }));
+      specimenRows.push(Object.assign({}, base, getMagicStepRange(type, specimen), {
+        method_codes: protocol,
+        description: getMagicSpecimenNotes(specimen).join("; ")
+      }));
     }
 
     specimenRows.forEach(function(row) {
       specimensLines.push(getMagicRow(specimensHeader, row));
     });
 
+    if(hasMagicUnmatchedSteps(specimen)) {
+      unmatchedSteps.push(specimen.name);
+    }
+
     // Steps hidden, or left out of an interpretation within its range, are marked b
-    let excludedSteps = getMagicExcludedSteps(specimen);
+    let excludedSteps = getMagicExcludedSteps(specimen, type);
 
     if(excludedSteps.conflicts.length > 0 || excludedSteps.ambiguous) {
       skippedStepConflicts.push(specimen.name);
@@ -1581,10 +1591,6 @@ function convert_MAGIC() {
       let dir = stepToDirection(step);
 
       let treatment = getMagicMeasurementTreatment(type, step.step, i);
-
-      if(isNaN(treatment.value)) {
-        unreadSteps.push(specimen.name + " " + step.step);
-      }
 
       let quality = excludedSteps.excluded.has(i) ? "b" : "g";
 
@@ -1605,10 +1611,7 @@ function convert_MAGIC() {
   });
 
   notifyMagicSkippedStepConflicts(skippedStepConflicts);
-
-  if(unreadSteps.length > 0) {
-    notify("warning", "The treatment of " + unreadSteps.length + " step(s) could not be read from the step label and was left empty (" + unreadSteps.slice(0, 3).join(", ") + (unreadSteps.length > 3 ? ", ..." : "") + ").");
-  }
+  notifyMagicUnmatchedSteps(unmatchedSteps);
 
   let content = [
 

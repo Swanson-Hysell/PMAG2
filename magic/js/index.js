@@ -292,7 +292,8 @@ function exportMagIC() {
     "height",
     // Geology
     "geologic_classes",
-    "lithologies"
+    "lithologies",
+    "description"
   );
   
   var specimensHeader = new Array(
@@ -385,7 +386,9 @@ function exportMagIC() {
   var skippedStepConflicts = new Array();
 
   // One demagnetization type per specimen, used in every table
-  var fileSpecimens = data.map(file => JSON.parse(file.data).specimens);
+  // Steps whose label gives no treatment are left out; then one demagnetization type per specimen
+  var fileSpecimens = data.map(file => JSON.parse(file.data).specimens.map(getMagicReadableSpecimen));
+  notifyMagicUnreadableSteps(fileSpecimens.flat());
   var specimenTypes = getMagicDemagnetizationTypes(fileSpecimens.flat());
   var experimentNames = new Object();
 
@@ -393,7 +396,8 @@ function exportMagIC() {
     return notify("danger", new Exception("No specimens to export."));
   }
 
-  notifyMagicOrientationConflicts(fileSpecimens.flat().filter(x => specimenTypes.get(x)), x => x.sample || x.name);
+  var orientationConflicts = notifyMagicOrientationConflicts(fileSpecimens.flat().filter(x => specimenTypes.get(x)), x => x.sample || x.name);
+  var unmatchedSteps = new Array();
 
   // Sites are taken from the sample names by a naming convention entered by the user
   var siteOf = getMagicSiteNaming();
@@ -505,16 +509,21 @@ function exportMagIC() {
 
         if(specimenRows.length === 0) {
           specimenRows.push(Object.assign({}, specimenBase, getMagicStepRange(type, specimen), {
-            "method_codes": protocol
+            "method_codes": protocol,
+            "description": getMagicSpecimenNotes(specimen).join("; ")
           }));
         }
 
         specimenRows.forEach(function(row) {
           magicSpecimens.push(getMagicRow(specimensHeader, row));
         });
+
+        if(hasMagicUnmatchedSteps(specimen)) {
+          unmatchedSteps.push(specimen.name);
+        }
       
         // Steps hidden, or left out of an interpretation within its range, are marked b
-        var excludedSteps = getMagicExcludedSteps(specimen);
+        var excludedSteps = getMagicExcludedSteps(specimen, type);
 
         if(excludedSteps.conflicts.length > 0 || excludedSteps.ambiguous) {
           skippedStepConflicts.push(specimen.name);
@@ -601,7 +610,8 @@ function exportMagIC() {
       "method_codes": joinMagicValues(record.protocols),
       "citations": "This study",
       "geologic_classes": getMagicGeologicClasses(record.geologies),
-      "lithologies": joinMagicValues(record.lithologies)
+      "lithologies": joinMagicValues(record.lithologies),
+      "description": orientationConflicts.includes(sampleName) ? MAGIC_ORIENTATION_CONFLICT_NOTE : ""
     }, getMagicMeanPosition(record.positions) || {})));
   });
 
@@ -615,6 +625,7 @@ function exportMagIC() {
   ).map(table => table.join(LINE_DELIMITER)).join(LINE_DELIMITER + MAGIC_TABLE_DELIMITER + LINE_DELIMITER);
 
   notifyMagicSkippedStepConflicts(skippedStepConflicts);
+  notifyMagicUnmatchedSteps(unmatchedSteps);
 
   downloadMagICTXT(lines);
 

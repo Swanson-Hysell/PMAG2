@@ -78,6 +78,36 @@ function getMagicStepValue(step) {
   return Number(number[0]);
 }
 
+// Returns the specimen without the steps whose label gives no treatment (e.g. "nrn", or the Remasoft fit rows
+// Cb, Cc and GC that the RS3 importer reads as steps), with their labels in unreadableSteps, or the specimen
+// itself when every step can be read
+function getMagicReadableSpecimen(specimen) {
+  if (!specimen.steps) return specimen;
+  const readable = specimen.steps.filter(step => !isNaN(getMagicStepValue(step.step)));
+  if (readable.length === specimen.steps.length) return specimen;
+  return Object.assign({}, specimen, {
+    steps: readable,
+    unreadableSteps: specimen.steps.filter(step => isNaN(getMagicStepValue(step.step))).map(step => String(step.step))
+  });
+}
+
+// Returns the notes on a specimen for the description of its rows in the specimens table
+function getMagicSpecimenNotes(specimen) {
+  return specimen.unreadableSteps ? ["steps left out, as their labels give no treatment: " + specimen.unreadableSteps.join(", ")] : [];
+}
+
+// Warns about specimens whose steps without a treatment were left out, and those left with no step
+function notifyMagicUnreadableSteps(specimens) {
+  const affected = specimens.filter(x => x.unreadableSteps);
+  if (affected.length === 0) return;
+  const listed = affected.slice(0, 5).map(x => x.name + " (" + x.unreadableSteps.join(", ") + ")");
+  notify("warning", `In ${affected.length} specimen(s) steps whose label gives no treatment were left out (each is noted in the description of the specimen): ${listed.join("; ")}${affected.length > 5 ? "; ..." : ""}.`);
+  const empty = affected.filter(x => x.steps.length === 0);
+  if (empty.length > 0) {
+    notify("warning", `${empty.length} specimen(s) have no step with a treatment and were left out: ${empty.slice(0, 5).map(x => x.name).join(", ")}${empty.length > 5 ? ", ..." : ""}.`);
+  }
+}
+
 // Converts a step value to MagIC units: °C to K, mT to T
 function toMagicStep(type, value) {
   if (type === "thermal") return value + 273;
@@ -142,6 +172,14 @@ function getMagicInterpretationRows(specimen, type, base) {
   const components = [];
   const rows = [];
 
+  // Notes on every row (worded as PmagPy's convert_2_magic.col writes them): steps left out of the measurements,
+  // and interpretations that cannot be re-made
+  const excluded = getMagicExcludedSteps(specimen, type);
+  const specimenNotes = getMagicSpecimenNotes(specimen);
+  const conflictNotes = (excluded.conflicts.length > 0 || excluded.ambiguous) ?
+    ["the fits of this specimen cannot be re-made from the measurements: a step left out of one fit is used by " +
+     "another, or steps with the same label cannot be told apart"] : [];
+
   interpretations.forEach(function(interpretation) {
 
     if (interpretation.fitted && interpretation.type === "TAU1") return;
@@ -155,9 +193,16 @@ function getMagicInterpretationRows(specimen, type, base) {
     if (interpretation.type === "TAU3") code = "DE-BFP";
     else if (interpretation.anchored) code = "DE-BFL-A";
 
-    const row = Object.assign({}, base, getMagicStepRange(type, specimen, getMagicInterpretationSteps(specimen, interpretation).indices), {
+    // The steps of the interpretation that are among the measurements
+    const indices = getMagicInterpretationSteps(specimen, interpretation).indices;
+    const notes = [];
+    if (indices.length < interpretation.steps.length) {
+      notes.push(`${interpretation.steps.length - indices.length} of the ${interpretation.steps.length} steps stored with the fit are not among the measurements`);
+    }
+
+    const row = Object.assign({}, base, getMagicStepRange(type, specimen, indices), {
       dir_comp: count === 0 ? group : group + "_" + (count + 1),
-      dir_n_measurements: interpretation.steps.length,
+      dir_n_measurements: indices.length,
       result_quality: "g",
       software_packages: ("Paleomagnetism.org " + (interpretation.version || "")).trim()
     });
@@ -183,22 +228,22 @@ function getMagicInterpretationRows(specimen, type, base) {
 
       const direction = getMagicInterpretationCoordinates(specimen, interpretation, frame.reference).toVector(Direction);
 
-      const notes = [];
+      const frameNotes = [];
       if (interpretation.type === "TAU3") {
-        notes.push("pole to the best-fit plane " + (interpretation.anchored ? "through the origin" : "through the center of mass of the steps"));
+        frameNotes.push("pole to the best-fit plane " + (interpretation.anchored ? "through the origin" : "through the center of mass of the steps"));
       }
       if (fitted) {
         const fittedDirection = getMagicInterpretationCoordinates(specimen, fitted, frame.reference).toVector(Direction);
-        notes.push(`direction on this plane fitted to a mean direction (McFadden and McElhinny, 1988): ${fittedDirection.dec.toFixed(1)} / ${fittedDirection.inc.toFixed(1)}`);
+        frameNotes.push(`direction on this plane fitted to a mean direction (McFadden and McElhinny, 1988): ${fittedDirection.dec.toFixed(1)} / ${fittedDirection.inc.toFixed(1)}`);
       }
-      if (interpretation.comment) notes.push(String(interpretation.comment));
+      if (interpretation.comment) frameNotes.push(String(interpretation.comment));
 
       rows.push(Object.assign({}, row, {
         dir_dec: Number(direction.dec.toFixed(4)),
         dir_inc: Number(direction.inc.toFixed(4)),
         dir_tilt_correction: frame.tiltCorrection,
         method_codes: [protocol, code, frame.code].join(":"),
-        description: notes.join("; ")
+        description: frameNotes.concat(specimenNotes, notes, conflictNotes).join("; ")
       }));
 
     });
@@ -226,12 +271,16 @@ function getMagicInterpretationSteps(specimen, interpretation) {
 }
 
 // Returns the steps (indices) that MagIC marks b, so that the interpretations can be re-made from the measurements:
-// steps hidden in Paleomagnetism.org, and steps between the first and last step of an interpretation that it does
-// not use. A step that an interpretation uses is not marked; if another interpretation skips it, it is a conflict,
-// as are steps that cannot be told apart from those an interpretation uses.
-function getMagicExcludedSteps(specimen) {
+// steps hidden in Paleomagnetism.org, and steps that an interpretation does not use although they are between its
+// first and last step, or have a treatment within its range (a repeated step measured after it, for example).
+// A step that an interpretation uses is not marked; if another interpretation skips it, it is a conflict,
+// as are steps that cannot be told apart from those an interpretation uses. The treatments are compared as in
+// the measurements table: the NRM (a step of 0, or a first thermal step at room temperature) is 0.
+function getMagicExcludedSteps(specimen, type) {
   const skipped = new Set();
   const used = new Set();
+  const values = specimen.steps.map(step => getMagicStepValue(step.step));
+  if (type === "thermal" && values.length > 0 && values[0] <= 25) values[0] = 0;
   let ambiguous = false;
 
   (specimen.interpretations || []).forEach(function(interpretation) {
@@ -242,6 +291,13 @@ function getMagicExcludedSteps(specimen) {
     indices.forEach(i => used.add(i));
     for (let i = Math.min(...indices); i <= Math.max(...indices); i++) {
       if (!indices.includes(i)) skipped.add(i);
+    }
+    const inRange = indices.map(i => values[i]).filter(x => !isNaN(x));
+    if (inRange.length > 0) {
+      const low = Math.min(...inRange), high = Math.max(...inRange);
+      values.forEach(function(value, i) {
+        if (!indices.includes(i) && !isNaN(value) && value >= low && value <= high) skipped.add(i);
+      });
     }
   });
 
@@ -257,7 +313,19 @@ function getMagicExcludedSteps(specimen) {
 // Warns about specimens in which a step left out of one interpretation is used by another
 function notifyMagicSkippedStepConflicts(names) {
   if (names.length === 0) return;
-  notify("warning", `In ${names.length} specimen(s) an interpretation cannot be re-made from the MagIC measurements, because a step left out of one interpretation is used by another, or steps with the same label cannot be told apart: ${names.slice(0, 5).join(", ")}${names.length > 5 ? ", ..." : ""}.`);
+  notify("warning", `In ${names.length} specimen(s) an interpretation cannot be re-made from the MagIC measurements, because a step left out of one interpretation is used by another, or steps with the same label cannot be told apart (each interpretation is noted in its description): ${names.slice(0, 5).join(", ")}${names.length > 5 ? ", ..." : ""}.`);
+}
+
+// True when an interpretation of the specimen has steps that are not among its measurements
+function hasMagicUnmatchedSteps(specimen) {
+  return (specimen.interpretations || []).some(x => !(x.fitted && x.type === "TAU1") &&
+    getMagicInterpretationSteps(specimen, x).indices.length < x.steps.length);
+}
+
+// Warns about specimens with an interpretation whose steps are not all among the measurements
+function notifyMagicUnmatchedSteps(names) {
+  if (names.length === 0) return;
+  notify("warning", `In ${names.length} specimen(s) a step stored with an interpretation is not among the measurements, so the interpretation counts only the steps found (each interpretation is noted in its description): ${names.slice(0, 5).join(", ")}${names.length > 5 ? ", ..." : ""}.`);
 }
 
 // Returns the direction of an interpretation in a reference frame: as stored with the interpretation (editing the
@@ -272,7 +340,7 @@ function getMagicInterpretationCoordinates(specimen, interpretation, reference) 
 }
 
 // Warns about samples whose specimens (or copies of one specimen) have different orientations or bedding:
-// the samples table holds one orientation per sample
+// the samples table holds one orientation per sample. Returns the samples, to be noted in their descriptions.
 function notifyMagicOrientationConflicts(specimens, getSample) {
   const orientations = new Map();
   const conflicts = [];
@@ -292,12 +360,16 @@ function notifyMagicOrientationConflicts(specimens, getSample) {
       "Their copies are exported as numbered experiments of one specimen. Give them distinct names if they are different specimens.");
   }
 
-  if (conflicts.length === 0) return;
+  if (conflicts.length === 0) return conflicts;
 
   notify("warning", `${conflicts.length} sample(s) have specimens (or copies of a specimen) with different orientations or bedding: ${conflicts.slice(0, 5).join(", ")}${conflicts.length > 5 ? ", ..." : ""}. ` +
-    "The MagIC samples table holds the orientation of the first, so the geographic and tilt-corrected directions of the others do not follow from it. " +
+    "The MagIC samples table holds the orientation of the first, so the geographic and tilt-corrected directions of the others do not follow from it (each sample is noted in its description). " +
     "Give these specimens distinct names and samples before exporting.");
+  return conflicts;
 }
+
+// The description of a sample whose specimens have different orientations or bedding
+const MAGIC_ORIENTATION_CONFLICT_NOTE = "its specimens (or copies of a specimen) have different orientations or bedding; this row has those of the first";
 
 // Returns a function giving the site of a sample by one of PmagPy's sample naming conventions
 // ("1", "2", "3", "4-Z", "5", "7-Z"), or null for an answer that is not one of them
@@ -464,13 +536,15 @@ function getMagicVolume(specimen) {
 
 // Returns the magnetization of a step: magn_volume (A/m) and, with a specimen volume, the moment magn_moment
 // and its components magn_x, magn_y, magn_z (Am²). Steps are in μA/m, or in pAm² for the Utrecht intensity bug.
-// Specimens marked volumeAssumed were imported from moments with an assumed volume: they get the moment only.
+// Specimens marked volumeAssumed were imported from moments with an assumed volume: they get the moment only
+// (neither, when the volume cannot be read).
 function getMagicMagnetization(specimen, step) {
   const volume = getMagicVolume(specimen);
   const length = Math.sqrt(step.x * step.x + step.y * step.y + step.z * step.z);
   let momentScale = null, volumeScale = null;
-  if (specimen.volumeAssumed && Number(specimen.volume) > 0) {
-    momentScale = 1E-12 * Number(specimen.volume);
+  if (specimen.volumeAssumed) {
+    // moments read with an assumed volume: without a readable volume neither the moment nor the magnetization is known
+    if (Number(specimen.volume) > 0) momentScale = 1E-12 * Number(specimen.volume);
   } else if (isUtrechtIntensityBug(specimen)) {
     momentScale = 1E-12;
     if (volume !== null) volumeScale = 1E-6 / volume;
