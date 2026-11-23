@@ -16,15 +16,34 @@ function getMagicDemagnetizationType(type) {
   return null;
 }
 
-// Returns the type given by the units of the step labels (20mT, AF 40; 350C, T350), or null
+// Returns the type given by the label of one step (20mT, AF 40; 350C, T350, TT 350 as in CIT files), or null
+function getMagicStepLabelType(label) {
+  label = String(label).trim();
+  if (/mT$/i.test(label) || /^AF/i.test(label)) return "alternating";
+  if (/\d\s*(°|º)?C$/i.test(label) || /^(TT|TH|T)\s*\d/i.test(label)) return "thermal";
+  return null;
+}
+
+// Returns the type of the first step whose label gives one, or null. A specimen can be demagnetized with
+// alternating fields and then thermally (or the reverse): each such step keeps the type of its own label.
 function getMagicDemagnetizationTypeFromSteps(steps) {
-  const types = new Set();
-  steps.forEach(function(step) {
-    const label = String(step.step).trim();
-    if (/mT$/i.test(label) || /^AF/i.test(label)) types.add("alternating");
-    else if (/\d\s*(°|º)?C$/i.test(label) || /^T\s*\d/i.test(label)) types.add("thermal");
-  });
-  return types.size === 1 ? [...types][0] : null;
+  for (const step of steps) {
+    const type = getMagicStepLabelType(step.step);
+    if (type !== null) return type;
+  }
+  return null;
+}
+
+// Returns the type of each step of a specimen: the type of its label, or else the type of the specimen
+function getMagicStepTypes(specimen, type) {
+  return specimen.steps.map(step => getMagicStepLabelType(step.step) || type);
+}
+
+// Returns the protocol method codes (LP-DIR-AF, LP-DIR-T) of the steps of a specimen with the given indices,
+// or of all its steps, in the order they first occur
+function getMagicProtocols(specimen, type, indices) {
+  const types = getMagicStepTypes(specimen, type).filter((x, i) => !indices || indices.includes(i));
+  return [...new Set(types.length > 0 ? types : [type])].map(x => MAGIC_PROTOCOL_CODES[x]);
 }
 
 // Returns a Map of each specimen with steps to its type: the importer's, or the one given by the step labels.
@@ -114,42 +133,74 @@ function toMagicStep(type, value) {
   return Number((value / 1000).toPrecision(12)); // avoids 0.007500000000000001
 }
 
+// Returns the alternating field of a step in mT. CIT files (format CALTECH) give AF levels in G (0.1 mT).
+function getMagicFieldValue(specimen, value) {
+  return (specimen && specimen.format === "CALTECH") ? Number((value / 10).toPrecision(12)) : value;
+}
+
 // Returns the treatment columns and method codes of a step: LT-NO for the NRM (a step of 0, or a first
-// thermal step at room temperature), LT-T-Z or LT-AF-Z otherwise
-function getMagicMeasurementTreatment(type, step, index) {
-  const value = getMagicStepValue(step);
-  const protocol = MAGIC_PROTOCOL_CODES[type];
+// thermal step at room temperature), LT-T-Z or LT-AF-Z otherwise. The type of the step is the type of its
+// label, or else the type of the specimen.
+function getMagicMeasurementTreatment(type, step, index, specimen) {
+  const stepType = getMagicStepLabelType(step) || type;
+  let value = getMagicStepValue(step);
+  const protocol = MAGIC_PROTOCOL_CODES[stepType];
 
   // A label without a number is written without a treatment
   if (isNaN(value)) {
-    return { value: value, treat_temp: "", treat_ac_field: "", method_codes: protocol };
+    return { type: stepType, value: value, treat_temp: "", treat_ac_field: "", method_codes: protocol };
   }
 
-  const isNRM = value === 0 || (type === "thermal" && index === 0 && value <= 25);
+  if (stepType === "alternating") value = getMagicFieldValue(specimen, value);
+
+  const isNRM = value === 0 || (stepType === "thermal" && index === 0 && value <= 25);
 
   return {
+    type: stepType,
     value: value,
-    treat_temp: (type === "thermal" && !isNRM) ? toMagicStep(type, value) : MAGIC_UNHEATED_TEMPERATURE,
-    treat_ac_field: type === "alternating" ? toMagicStep(type, value) : 0,
-    method_codes: (isNRM ? "LT-NO" : MAGIC_STEP_CODES[type]) + ":" + protocol
+    treat_temp: (stepType === "thermal" && !isNRM) ? toMagicStep(stepType, value) : MAGIC_UNHEATED_TEMPERATURE,
+    treat_ac_field: stepType === "alternating" ? toMagicStep(stepType, value) : 0,
+    method_codes: (isNRM ? "LT-NO" : MAGIC_STEP_CODES[stepType]) + ":" + protocol
   };
 }
 
-// Returns the lowest and highest treatment (as in the measurements table) of the steps of a specimen
-// with the given indices, or of all its steps
-function getMagicStepRange(type, specimen, indices) {
-  const values = [];
+// Returns the treatments of the steps of a specimen with the given indices, or of all its steps, other than the NRM
+function getMagicTreatments(type, specimen, indices) {
+  const treatments = [];
   specimen.steps.forEach(function(step, i) {
     if (indices && !indices.includes(i)) return;
-    const treatment = getMagicMeasurementTreatment(type, step.step, i);
-    const value = type === "thermal" ? treatment.treat_temp : treatment.treat_ac_field;
-    if (value !== "") values.push(value);
+    const treatment = getMagicMeasurementTreatment(type, step.step, i, specimen);
+    if (treatment.treat_temp !== "") treatments.push(treatment);
   });
+  return treatments;
+}
+
+// Returns the lowest and highest treatment (as in the measurements table) of the steps of a specimen
+// with the given indices, or of all its steps. MagIC has one unit for the range, so a range over both
+// alternating field and thermal steps is left empty and described instead (getMagicStepRangeNotes).
+function getMagicStepRange(type, specimen, indices) {
+  const treatments = getMagicTreatments(type, specimen, indices);
+  const types = new Set(treatments.filter(x => !x.method_codes.startsWith("LT-NO")).map(x => x.type));
+  if (types.size > 1) return { meas_step_min: "", meas_step_max: "", meas_step_unit: "" };
+  const rangeType = types.size === 1 ? [...types][0] : type;
+  const values = treatments.map(x => rangeType === "thermal" ? x.treat_temp : x.treat_ac_field);
   return {
     meas_step_min: values.length ? Math.min(...values) : "",
     meas_step_max: values.length ? Math.max(...values) : "",
-    meas_step_unit: MAGIC_STEP_UNITS[type]
+    meas_step_unit: MAGIC_STEP_UNITS[rangeType]
   };
+}
+
+// Returns a note giving the steps of a range over both alternating field and thermal steps, or no note
+function getMagicStepRangeNotes(type, specimen, indices) {
+  const steps = getMagicTreatments(type, specimen, indices).filter(x => !x.method_codes.startsWith("LT-NO"));
+  const af = steps.filter(x => x.type === "alternating").map(x => x.value);
+  const thermal = steps.filter(x => x.type === "thermal").map(x => x.value);
+  if (af.length === 0 || thermal.length === 0) return [];
+  const range = (values, unit) => Math.min(...values) === Math.max(...values) ?
+    `${Math.min(...values)} ${unit}` : `${Math.min(...values)}-${Math.max(...values)} ${unit}`;
+  const includesNRM = getMagicTreatments(type, specimen, indices).some(x => x.method_codes.startsWith("LT-NO"));
+  return [`steps over two demagnetization types, so no single step range: ${includesNRM ? "NRM, " : ""}alternating field ${range(af, "mT")} and thermal ${range(thermal, "°C")}`];
 }
 
 // The reference frames of the interpretations, with their MagIC tilt correction and method code
@@ -164,7 +215,6 @@ const MAGIC_REFERENCE_FRAMES = [
 // A plane fitted to a mean direction (McFadden & McElhinny, 1988) has a fitted line: it is not written
 // as an interpretation, and the description of the plane gives its direction.
 function getMagicInterpretationRows(specimen, type, base) {
-  const protocol = MAGIC_PROTOCOL_CODES[type];
   const isSet = (value) => value !== null && value !== undefined;
   const hasOrientation = isSet(specimen.coreAzimuth) && isSet(specimen.coreDip);
   const hasBedding = hasOrientation && isSet(specimen.beddingStrike) && isSet(specimen.beddingDip);
@@ -195,7 +245,8 @@ function getMagicInterpretationRows(specimen, type, base) {
 
     // The steps of the interpretation that are among the measurements
     const indices = getMagicInterpretationSteps(specimen, interpretation).indices;
-    const notes = [];
+    const protocol = getMagicProtocols(specimen, type, indices).join(":");
+    const notes = getMagicStepRangeNotes(type, specimen, indices);
     if (indices.length < interpretation.steps.length) {
       notes.push(`${interpretation.steps.length - indices.length} of the ${interpretation.steps.length} steps stored with the fit are not among the measurements`);
     }
@@ -275,12 +326,14 @@ function getMagicInterpretationSteps(specimen, interpretation) {
 // first and last step, or have a treatment within its range (a repeated step measured after it, for example).
 // A step that an interpretation uses is not marked; if another interpretation skips it, it is a conflict,
 // as are steps that cannot be told apart from those an interpretation uses. The treatments are compared as in
-// the measurements table: the NRM (a step of 0, or a first thermal step at room temperature) is 0.
+// the measurements table: the NRM (a step of 0, or a first thermal step at room temperature) is 0. A range is
+// compared only with steps of the same demagnetization type (alternating field or thermal), and the NRM.
 function getMagicExcludedSteps(specimen, type) {
   const skipped = new Set();
   const used = new Set();
-  const values = specimen.steps.map(step => getMagicStepValue(step.step));
-  if (type === "thermal" && values.length > 0 && values[0] <= 25) values[0] = 0;
+  const treatments = specimen.steps.map((step, i) => getMagicMeasurementTreatment(type, step.step, i, specimen));
+  const values = treatments.map(x => x.method_codes.startsWith("LT-NO") ? 0 : x.value);
+  const stepTypes = treatments.map(x => x.method_codes.startsWith("LT-NO") ? "NRM" : x.type);
   let ambiguous = false;
 
   (specimen.interpretations || []).forEach(function(interpretation) {
@@ -292,12 +345,20 @@ function getMagicExcludedSteps(specimen, type) {
     for (let i = Math.min(...indices); i <= Math.max(...indices); i++) {
       if (!indices.includes(i)) skipped.add(i);
     }
-    const inRange = indices.map(i => values[i]).filter(x => !isNaN(x));
-    if (inRange.length > 0) {
+    // The range of each type (alternating field, thermal) among the steps of the interpretation; the NRM is
+    // in the range of either type that starts at 0
+    [...new Set(indices.map(i => stepTypes[i]))].forEach(function(rangeType) {
+      const inRange = indices.filter(i => stepTypes[i] === rangeType || stepTypes[i] === "NRM").map(i => values[i]).filter(x => !isNaN(x));
+      if (rangeType === "NRM" || inRange.length === 0) return;
       const low = Math.min(...inRange), high = Math.max(...inRange);
       values.forEach(function(value, i) {
-        if (!indices.includes(i) && !isNaN(value) && value >= low && value <= high) skipped.add(i);
+        if (indices.includes(i) || isNaN(value)) return;
+        if ((stepTypes[i] === rangeType || (stepTypes[i] === "NRM" && low === 0)) && value >= low && value <= high) skipped.add(i);
       });
+    });
+    // An interpretation of the NRM only
+    if (indices.every(i => stepTypes[i] === "NRM")) {
+      values.forEach((value, i) => { if (!indices.includes(i) && stepTypes[i] === "NRM") skipped.add(i); });
     }
   });
 

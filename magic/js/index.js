@@ -454,8 +454,10 @@ function exportMagIC() {
 
         // The step code names the experiment (numbered if a specimen name occurs more than once in a file);
         // the protocol is the method of samples, sites and locations
-        var demagnetizationType = (type === "thermal" ? DEMAGNETIZATION_THERMAL : DEMAGNETIZATION_ALTERNATING);
-        var protocol = MAGIC_PROTOCOL_CODES[type];
+        // A specimen demagnetized with alternating fields and then thermally (or the reverse) has both
+        var demagnetizationType = [...new Set(getMagicStepTypes(specimen, type))].map(x => x === "thermal" ? DEMAGNETIZATION_THERMAL : DEMAGNETIZATION_ALTERNATING).join("_");
+        var protocols = getMagicProtocols(specimen, type);
+        var protocol = protocols.join(":");
         var experiment = specimen.name + "_" + fileIndex + "_" + demagnetizationType;
         experimentNames[experiment] = (experimentNames[experiment] || 0) + 1;
         if(experimentNames[experiment] > 1) {
@@ -464,7 +466,7 @@ function exportMagIC() {
       
         // For sites
         siteCollection.ages.push([specimen.age, specimen.ageMin, specimen.ageMax]);
-        siteCollection.demagnetizationTypes.add(protocol);
+        protocols.forEach(x => siteCollection.demagnetizationTypes.add(x));
         siteCollection.lithologies.add(specimen.lithology);
         siteCollection.geologies.add(specimen.geology);
         siteCollection.positions.push([specimen.latitude, specimen.longitude]);
@@ -486,7 +488,7 @@ function exportMagIC() {
         }
 
         var sampleRecord = magicSampleRecords[sampleName];
-        sampleRecord.protocols.push(protocol);
+        sampleRecord.protocols.push(...protocols);
         sampleRecord.positions.push([specimen.latitude, specimen.longitude]);
         sampleRecord.geologies.push(specimen.geology);
         sampleRecord.lithologies.push(specimen.lithology);
@@ -510,7 +512,7 @@ function exportMagIC() {
         if(specimenRows.length === 0) {
           specimenRows.push(Object.assign({}, specimenBase, getMagicStepRange(type, specimen), {
             "method_codes": protocol,
-            "description": getMagicSpecimenNotes(specimen).join("; ")
+            "description": getMagicStepRangeNotes(type, specimen).concat(getMagicSpecimenNotes(specimen)).join("; ")
           }));
         }
 
@@ -534,7 +536,7 @@ function exportMagIC() {
       
           // Convert x, y, z in specimen coordinates to a direction
           var direction = new Coordinates(step.x, step.y, step.z).toVector(Direction);
-          var treatment = getMagicMeasurementTreatment(type, step.step, i);
+          var treatment = getMagicMeasurementTreatment(type, step.step, i, specimen);
       
           // Moments (Am²) with a specimen volume, and magnetization (A/m)
           var magnetization = getMagicMagnetization(specimen, step);
@@ -571,7 +573,7 @@ function exportMagIC() {
   // The study location, from all exported specimens
   var exportedSpecimens = fileSpecimens.flat().filter(x => specimenTypes.get(x));
   magicLocations.push(getMagicRow(MAGIC_LOCATION_HEADER, getMagicLocationRow(locationName, exportedSpecimens,
-    exportedSpecimens.map(x => MAGIC_PROTOCOL_CODES[specimenTypes.get(x)]))));
+    exportedSpecimens.flatMap(x => getMagicProtocols(x, specimenTypes.get(x))))));
 
   // One row per site
   Object.entries(magicSiteRecords).forEach(function([siteName, siteCollection]) {

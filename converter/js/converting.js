@@ -1389,8 +1389,9 @@ function convert_MAGIC() {
     let siteName =
       siteOf(sampleName);
 
-    let protocol =
-      MAGIC_PROTOCOL_CODES[specimenTypes.get(specimen)];
+    // The protocols of the steps (LP-DIR-AF, LP-DIR-T, or both)
+    let protocols =
+      getMagicProtocols(specimen, specimenTypes.get(specimen));
 
     if(!sitesMap[siteName]) {
       sitesMap[siteName] = { positions: [], geology: [], lithology: [], protocols: [], ages: [] };
@@ -1401,7 +1402,7 @@ function convert_MAGIC() {
     site.positions.push([specimen.latitude, specimen.longitude]);
     site.geology.push(specimen.geology);
     site.lithology.push(specimen.lithology);
-    site.protocols.push(protocol);
+    site.protocols.push(...protocols);
     site.ages.push([specimen.age, specimen.ageMin, specimen.ageMax]);
 
     if(!samplesMap[sampleName]) {
@@ -1448,7 +1449,7 @@ function convert_MAGIC() {
     sample.positions.push([specimen.latitude, specimen.longitude]);
     sample.geology.push(specimen.geology);
     sample.lithology.push(specimen.lithology);
-    sample.protocols.push(protocol);
+    sample.protocols.push(...protocols);
 
   });
 
@@ -1480,7 +1481,7 @@ function convert_MAGIC() {
     "tab delimited\tlocations",
     MAGIC_LOCATION_HEADER.join("\t"),
     getMagicRow(MAGIC_LOCATION_HEADER, getMagicLocationRow(locationName, exportSpecimens,
-      exportSpecimens.map(x => MAGIC_PROTOCOL_CODES[specimenTypes.get(x)])))
+      exportSpecimens.flatMap(x => getMagicProtocols(x, specimenTypes.get(x)))))
   ];
 
   const samplesHeader = [
@@ -1537,7 +1538,7 @@ function convert_MAGIC() {
       specimen.sample || specimen.name;
 
     let type = specimenTypes.get(specimen);
-    let protocol = MAGIC_PROTOCOL_CODES[type];
+    let protocol = getMagicProtocols(specimen, type).join(":");
 
     // The measurements of a specimen are one experiment (numbered if a specimen name is loaded more than once)
     let experiment = specimen.name + "_" + protocol;
@@ -1567,7 +1568,7 @@ function convert_MAGIC() {
     if(specimenRows.length === 0) {
       specimenRows.push(Object.assign({}, base, getMagicStepRange(type, specimen), {
         method_codes: protocol,
-        description: getMagicSpecimenNotes(specimen).join("; ")
+        description: getMagicStepRangeNotes(type, specimen).concat(getMagicSpecimenNotes(specimen)).join("; ")
       }));
     }
 
@@ -1590,7 +1591,7 @@ function convert_MAGIC() {
 
       let dir = stepToDirection(step);
 
-      let treatment = getMagicMeasurementTreatment(type, step.step, i);
+      let treatment = getMagicMeasurementTreatment(type, step.step, i, specimen);
 
       let quality = excludedSteps.excluded.has(i) ? "b" : "g";
 
